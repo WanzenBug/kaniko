@@ -1,0 +1,5 @@
+FROM alpine@sha256:5ce5f501c457015c4b91f91a15ac69157d9b06f1a75cf9107bf2b62e0843983a
+COPY --chown=1 context/foo foo
+COPY --chown=1:2 context/foo /foodir/
+COPY --chown=guest context/bar/b* bar/
+COPY --chown=guest:nogroup context/fo? /foo2

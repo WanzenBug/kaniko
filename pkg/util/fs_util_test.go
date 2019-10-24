@@ -825,3 +825,174 @@ func Test_correctDockerignoreFileIsUsed(t *testing.T) {
 		}
 	}
 }
+
+func setupIdentities() (string, error) {
+	// passwd format: "username:password:uid:gid:comment:home:shell"
+	passwdContents := `
+root:x:0:0::/root:zsh
+test:x:1:1:::
+testroot:x:2:3:::
+	`
+	// group format: "groupname:password:gid:users"
+	group := `
+root:x:0:
+testroot:x:2:
+testgroup:x:20:
+	`
+	tmpdir, err := ioutil.TempDir("", "")
+	if err != nil {
+		return "", err
+	}
+	err = os.Mkdir(filepath.Join(tmpdir, "etc"), 0755)
+	if err != nil {
+		return "", err
+	}
+	err = ioutil.WriteFile(filepath.Join(tmpdir, "etc", "passwd"), []byte(passwdContents), 0644)
+	if err != nil {
+		return "", err
+	}
+	err = ioutil.WriteFile(filepath.Join(tmpdir, "etc", "group"), []byte(group), 0644)
+	if err != nil {
+		return "", err
+	}
+	return tmpdir, nil
+}
+
+func TestIdentityFromChownStringSuccess(t *testing.T) {
+	type args struct {
+		chown            string
+		expectedIdentity FsIdentity
+	}
+	tests := []struct {
+		name string
+		args args
+	}{
+		{
+			name: "empty chown",
+			args: args{
+				chown: "",
+				expectedIdentity: FsIdentity{
+					override: false,
+					user:     0,
+					group:    0,
+				},
+			},
+		},
+		{
+			name: "id override only user",
+			args: args{
+				chown: "1",
+				expectedIdentity: FsIdentity{
+					override: true,
+					user:     1,
+					group:    1,
+				},
+			},
+		},
+		{
+			name: "id override both specified",
+			args: args{
+				chown: "1:20",
+				expectedIdentity: FsIdentity{
+					override: true,
+					user:     1,
+					group:    20,
+				},
+			},
+		},
+		{
+			name: "id override username specified",
+			args: args{
+				chown: "testroot",
+				expectedIdentity: FsIdentity{
+					override: true,
+					user:     2,
+					group:    2,
+				},
+			},
+		},
+		{
+			name: "id override both names specified",
+			args: args{
+				chown: "testroot:testgroup",
+				expectedIdentity: FsIdentity{
+					override: true,
+					user:     2,
+					group:    20,
+				},
+			},
+		},
+	}
+
+	fakeroot, err := setupIdentities()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ident, err := IdentityFromChownString(tt.args.chown, fakeroot)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if *ident != tt.args.expectedIdentity {
+				t.Errorf("expected '%v', got '%v' instead", tt.args.expectedIdentity, *ident)
+			}
+		})
+	}
+}
+
+func TestIdentityFromChownStringError(t *testing.T) {
+	type args struct {
+		chown string
+	}
+	tests := []struct {
+		name string
+		args args
+	}{
+		{
+			name: "invalid format",
+			args: args{
+				chown: ":::",
+			},
+		},
+		{
+			name: "unknown user",
+			args: args{
+				chown: "user",
+			},
+		},
+		{
+			name: "known user, unknown group",
+			args: args{
+				chown: "root:foo",
+			},
+		},
+		{
+			name: "unknown user, known group",
+			args: args{
+				chown: "foo:testgroup",
+			},
+		},
+		{
+			name: "unknown user, unknown group",
+			args: args{
+				chown: "foo:foo",
+			},
+		},
+	}
+
+	fakeroot, err := setupIdentities()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ident, err := IdentityFromChownString(tt.args.chown, fakeroot)
+			if err == nil {
+				t.Errorf("Expected error, got %v instead", *ident)
+			}
+		})
+	}
+}

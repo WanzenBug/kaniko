@@ -26,6 +26,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -34,6 +35,7 @@ import (
 	"github.com/docker/docker/builder/dockerignore"
 	"github.com/docker/docker/pkg/fileutils"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
+	"github.com/opencontainers/runc/libcontainer/user"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
@@ -421,7 +423,7 @@ func FilepathExists(path string) bool {
 }
 
 // CreateFile creates a file at path and copies over contents from the reader
-func CreateFile(path string, reader io.Reader, perm os.FileMode, uid uint32, gid uint32) error {
+func CreateFile(path string, reader io.Reader, perm os.FileMode, uid int, gid int) error {
 	// Create directory path if it doesn't exist
 	baseDir := filepath.Dir(path)
 	if _, err := os.Lstat(baseDir); os.IsNotExist(err) {
@@ -438,7 +440,7 @@ func CreateFile(path string, reader io.Reader, perm os.FileMode, uid uint32, gid
 	if _, err := io.Copy(dest, reader); err != nil {
 		return err
 	}
-	return setFilePermissions(path, perm, int(uid), int(gid))
+	return setFilePermissions(path, perm, uid, gid)
 }
 
 // AddVolumePath adds the given path to the volume whitelist.
@@ -478,7 +480,7 @@ func DownloadFileToDest(rawurl, dest string) error {
 
 // CopyDir copies the file or directory at src to dest
 // It returns a list of files it copied over
-func CopyDir(src, dest, buildcontext string) ([]string, error) {
+func CopyDir(src, dest, buildcontext string, identity *FsIdentity) ([]string, error) {
 	files, err := RelativeFiles("", src)
 	if err != nil {
 		return nil, err
@@ -499,8 +501,10 @@ func CopyDir(src, dest, buildcontext string) ([]string, error) {
 			logrus.Debugf("Creating directory %s", destPath)
 
 			mode := fi.Mode()
-			uid := int(fi.Sys().(*syscall.Stat_t).Uid)
-			gid := int(fi.Sys().(*syscall.Stat_t).Gid)
+			uid, gid, err := identity.getFsIdentities(fi)
+			if err != nil {
+				return nil, err
+			}
 
 			if err := mkdirAllWithPermissions(destPath, mode, uid, gid); err != nil {
 				return nil, err
@@ -512,7 +516,7 @@ func CopyDir(src, dest, buildcontext string) ([]string, error) {
 			}
 		} else {
 			// ... Else, we want to copy over a file
-			if _, err := CopyFile(fullPath, destPath, buildcontext); err != nil {
+			if _, err := CopyFile(fullPath, destPath, buildcontext, identity); err != nil {
 				return nil, err
 			}
 		}
@@ -540,14 +544,10 @@ func CopySymlink(src, dest, buildcontext string) (bool, error) {
 }
 
 // CopyFile copies the file at src to dest
-func CopyFile(src, dest, buildcontext string) (bool, error) {
+func CopyFile(src, dest, buildcontext string, identidy *FsIdentity) (bool, error) {
 	if excludeFile(src, buildcontext) {
 		logrus.Debugf("%s found in .dockerignore, ignoring", src)
 		return true, nil
-	}
-	fi, err := os.Stat(src)
-	if err != nil {
-		return false, err
 	}
 	logrus.Debugf("Copying file %s to %s", src, dest)
 	srcFile, err := os.Open(src)
@@ -555,8 +555,15 @@ func CopyFile(src, dest, buildcontext string) (bool, error) {
 		return false, err
 	}
 	defer srcFile.Close()
-	uid := fi.Sys().(*syscall.Stat_t).Uid
-	gid := fi.Sys().(*syscall.Stat_t).Gid
+
+	fi, err := os.Stat(src)
+	if err != nil {
+		return false, err
+	}
+	uid, gid, err := identidy.getFsIdentities(fi)
+	if err != nil {
+		return false, err
+	}
 	return false, CreateFile(dest, srcFile, fi.Mode(), uid, gid)
 }
 
@@ -656,4 +663,90 @@ func CreateTargetTarfile(tarpath string) (*os.File, error) {
 	}
 	return os.Create(tarpath)
 
+}
+
+type FsIdentity struct {
+	override bool
+	user     int
+	group    int
+}
+
+func IdentityFromChownString(chown string, fsroot string) (*FsIdentity, error) {
+	if chown == "" {
+		return NoOverrideIdentity(), nil
+	}
+
+	parts := strings.Split(chown, ":")
+	if len(parts) > 2 {
+		return nil, errors.Errorf("unsupported chown argument '%s'", chown)
+	}
+	username := parts[0]
+
+	userID, err := strconv.ParseInt(username, 10, 32)
+	if err != nil {
+		// Search for user_id in /etc/passwd
+		passwd := filepath.Join(fsroot, "etc", "passwd")
+		users, err := user.ParsePasswdFileFilter(passwd, func(u user.User) bool {
+			return u.Name == username
+		})
+		if err != nil {
+			return nil, err
+		}
+		if len(users) == 0 {
+			return nil, errors.Errorf("could not determine uid for user '%s'", username)
+		}
+
+		userID = int64(users[0].Uid)
+	}
+
+	if len(parts) == 1 {
+		// > Providing a username without groupname or a UID without GID will use the same numeric UID as the GID
+		// > https://docs.docker.com/engine/reference/builder/#add
+		return &FsIdentity{
+			override: true,
+			user:     int(userID),
+			group:    int(userID),
+		}, nil
+	}
+
+	// need to parse the group part, too
+	groupName := parts[1]
+	groupID, err := strconv.ParseInt(groupName, 10, 32)
+	if err != nil {
+		groups, err := user.ParseGroupFileFilter(filepath.Join(fsroot, "etc", "group"), func(group user.Group) bool {
+			return group.Name == groupName
+		})
+		if err != nil {
+			return nil, err
+		}
+		if len(groups) == 0 {
+			return nil, errors.Errorf("could not determine gid for group '%s'", groupName)
+		}
+
+		groupID = int64(groups[0].Gid)
+	}
+
+	return &FsIdentity{
+		override: true,
+		user:     int(userID),
+		group:    int(groupID),
+	}, nil
+}
+
+func NoOverrideIdentity() *FsIdentity {
+	return &FsIdentity{
+		override: false,
+		user:     0,
+		group:    0,
+	}
+}
+
+func (id *FsIdentity) getFsIdentities(srcInfo os.FileInfo) (int, int, error) {
+	if id.override {
+		return id.user, id.group, nil
+	}
+
+	uid := srcInfo.Sys().(*syscall.Stat_t).Uid
+	gid := srcInfo.Sys().(*syscall.Stat_t).Gid
+	return int(uid), int(gid), nil
 }

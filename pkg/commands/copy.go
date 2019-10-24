@@ -51,6 +51,11 @@ func (c *CopyCommand) ExecuteCommand(config *v1.Config, buildArgs *dockerfile.Bu
 		return err
 	}
 
+	identity, err := util.IdentityFromChownString(c.cmd.Chown, constants.RootDir)
+	if err != nil {
+		return err
+	}
+
 	// For each source, iterate through and copy it over
 	for _, src := range srcs {
 		fullPath := filepath.Join(c.buildcontext, src)
@@ -71,7 +76,7 @@ func (c *CopyCommand) ExecuteCommand(config *v1.Config, buildArgs *dockerfile.Bu
 				// we need to add '/' to the end to indicate the destination is a directory
 				dest = filepath.Join(cwd, dest) + "/"
 			}
-			copiedFiles, err := util.CopyDir(fullPath, dest, c.buildcontext)
+			copiedFiles, err := util.CopyDir(fullPath, dest, c.buildcontext, identity)
 			if err != nil {
 				return err
 			}
@@ -88,7 +93,7 @@ func (c *CopyCommand) ExecuteCommand(config *v1.Config, buildArgs *dockerfile.Bu
 			c.snapshotFiles = append(c.snapshotFiles, destPath)
 		} else {
 			// ... Else, we want to copy over a file
-			exclude, err := util.CopyFile(fullPath, destPath, c.buildcontext)
+			exclude, err := util.CopyFile(fullPath, destPath, c.buildcontext, identity)
 			if err != nil {
 				return err
 			}
